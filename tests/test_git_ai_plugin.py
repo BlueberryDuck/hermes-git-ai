@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -207,12 +208,11 @@ class GitAiPluginTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as directory:
                 directory_path = Path(directory)
-                executable = directory_path / "git-ai"
+                executable = directory_path / "git-ai.py"
                 log_path = directory_path / "call.json"
                 executable.write_text(
                     "\n".join(
                         [
-                            "#!/usr/bin/env python3",
                             "import json, os, sys",
                             "payload = json.load(sys.stdin)",
                             "with open(os.environ['GIT_AI_TEST_LOG'], 'w') as handle:",
@@ -222,7 +222,6 @@ class GitAiPluginTests(unittest.TestCase):
                     + "\n",
                     encoding="utf-8",
                 )
-                executable.chmod(0o755)
                 with patch.dict(
                     os.environ,
                     {
@@ -230,6 +229,8 @@ class GitAiPluginTests(unittest.TestCase):
                         "GIT_AI_TEST_LOG": str(log_path),
                         "HERMES_GIT_AI_TIMEOUT": "5",
                     },
+                ), patch.object(
+                    plugin, "_git_ai_command", return_value=[sys.executable, str(executable)]
                 ):
                     self.assertTrue(
                         plugin._run_checkpoint(
@@ -265,6 +266,63 @@ class GitAiPluginTests(unittest.TestCase):
                 task_id="task-1",
             )
         self.assertNotIn("transcript", self.calls[0][0])
+
+    def test_tool_events_do_not_depend_on_git_subprocesses(self):
+        self._seed_session()
+        cases = (
+            ("write_file", {"path": "src/new.py", "content": "value = 1\n"},
+             ["human", "ai_agent"]),
+            ("terminal", {"command": "echo generated", "workdir": str(self.repo)},
+             ["pre_shell_command", "post_shell_command"]),
+        )
+        for tool_name, args, expected_types in cases:
+            with self.subTest(tool=tool_name):
+                self.calls.clear()
+                plugin._REPO_CACHE.clear()
+                with patch.object(
+                    plugin.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 2)
+                ):
+                    plugin._on_pre_tool_call(
+                        tool_name=tool_name, args=args, session_id="session-1", task_id="task-1"
+                    )
+                    plugin._on_post_tool_call(
+                        tool_name=tool_name, args=args, session_id="session-1", task_id="task-1",
+                        result=json.dumps({"ok": True}), status="ok",
+                    )
+                self.assertEqual([payload["type"] for payload, _ in self.calls], expected_types)
+                self.assertTrue(all(cwd == str(self.repo) for _, cwd in self.calls))
+
+    def test_file_edits_find_normal_nested_and_linked_worktree_roots(self):
+        nested = self.repo / "nested"
+        subprocess.run(["git", "init", "-q", str(nested)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "-c", "user.name=Test User",
+             "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+             "commit", "--allow-empty", "-qm", "Initial commit"], check=True,
+        )
+        worktree = self.repo / "linked"
+        subprocess.run(
+            ["git", "-C", str(self.repo), "worktree", "add", "-q", "--detach", str(worktree)],
+            check=True,
+        )
+        self.assertTrue((worktree / ".git").is_file())
+        for root in (self.repo, nested, worktree):
+            with self.subTest(root=root.name):
+                self.calls.clear()
+                plugin._on_pre_tool_call(
+                    tool_name="write_file", args={"path": str(root / "new.txt"), "content": "new\n"},
+                    session_id="session-1", task_id="task-1",
+                )
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(self.calls[0][1], str(root))
+
+    def test_edits_outside_a_repository_are_not_checkpointed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin._on_pre_tool_call(
+                tool_name="write_file", args={"path": str(Path(directory) / "new.txt")},
+                session_id="session-1", task_id="task-1",
+            )
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":

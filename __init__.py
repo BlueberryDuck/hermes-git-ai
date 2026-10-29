@@ -210,6 +210,8 @@ def _terminal_cwd(args: Mapping[str, Any], session_id: str, task_id: str) -> Pat
 
 
 def _repo_root(path: Path) -> str | None:
+    # Git subprocess pipes can outlive their parent on Windows. Do not start
+    # a subprocess in a pre-tool policy hook just to locate a worktree.
     candidate = path if path.is_dir() else path.parent
     candidate = Path(os.path.abspath(os.fspath(candidate)))
     cache_key = os.fspath(candidate)
@@ -217,28 +219,14 @@ def _repo_root(path: Path) -> str | None:
         cached = _REPO_CACHE.get(cache_key)
     if cached:
         return cached
-
-    try:
-        completed = subprocess.run(
-            ["git", "-C", os.fspath(candidate), "rev-parse", "--show-toplevel"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-
-    root = completed.stdout.strip()
-    if not root:
-        return None
-    root = os.path.abspath(os.path.expanduser(root))
-    with _LOCK:
-        _REPO_CACHE[cache_key] = root
-    return root
+    for directory in (candidate, *candidate.parents):
+        marker = directory / ".git"
+        if marker.is_dir() or marker.is_file():
+            root = os.fspath(directory)
+            with _LOCK:
+                _REPO_CACHE[cache_key] = root
+            return root
+    return None
 
 
 def _patch_paths(args: Mapping[str, Any], task_id: str) -> list[Path]:
