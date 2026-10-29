@@ -60,6 +60,15 @@ class GitAiPluginTests(unittest.TestCase):
         self.calls.append((dict(payload), str(cwd)))
         return True
 
+    def _git_reference(self, directory):
+        with tempfile.TemporaryFile(mode="w+t") as output:
+            result = subprocess.run(["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
+                                    stdin=subprocess.DEVNULL, stdout=output,
+                                    stderr=subprocess.DEVNULL, timeout=15, check=False)
+            output.seek(0)
+            value = output.read().strip()
+        return result.returncode, os.path.normpath(value) if value else None
+
     def _seed_session(self):
         plugin._on_pre_llm_call(
             session_id="session-1",
@@ -226,7 +235,6 @@ class GitAiPluginTests(unittest.TestCase):
                 with patch.dict(
                     os.environ,
                     {
-                        "HERMES_GIT_AI_BIN": str(executable),
                         "GIT_AI_TEST_LOG": str(log_path),
                         "HERMES_GIT_AI_TIMEOUT": "5",
                     },
@@ -289,11 +297,26 @@ class GitAiPluginTests(unittest.TestCase):
                                      "HERMES_GIT_AI_DISABLED": ""}):
             self.assertEqual(plugin._git_ai_command(), [sys.executable])
 
+    def test_discovery_caches_only_successful_roots(self):
+        self.assertEqual(plugin._repo_root(self.repo), str(self.repo))
+        with patch.object(plugin.subprocess, "run", side_effect=OSError("unavailable")) as run:
+            self.assertEqual(plugin._repo_root(self.repo), str(self.repo))
+            self.assertEqual(run.call_count, 0)
+            plugin._REPO_CACHE.clear()
+            self.assertIsNone(plugin._repo_root(self.repo))
+            self.assertIsNone(plugin._repo_root(self.repo))
+            self.assertEqual(run.call_count, 2)
+
     def test_invalid_markers_follow_git_discovery(self):
         for outer in (False, True):
             for kind in ("file", "directory"):
                 with self.subTest(outer=outer, kind=kind):
-                    parent = self.repo if outer else Path(tempfile.mkdtemp())
+                    if outer:
+                        parent = self.repo
+                    else:
+                        standalone = tempfile.TemporaryDirectory()
+                        self.addCleanup(standalone.cleanup)
+                        parent = Path(standalone.name)
                     directory = parent / ("invalid-%s-%s" % (outer, kind))
                     directory.mkdir()
                     marker = directory / ".git"
@@ -303,12 +326,15 @@ class GitAiPluginTests(unittest.TestCase):
                         marker.mkdir()
                     plugin._REPO_CACHE.clear()
                     expected = str(self.repo) if outer and kind == "directory" else None
+                    reference = self._git_reference(directory)
+                    self.assertEqual(reference, (0 if expected else 128, expected))
+                    print('invalid marker', outer, kind, 'git', reference)
                     self.assertEqual(plugin._repo_root(directory), expected)
                     self.calls.clear()
                     plugin._on_pre_tool_call(tool_name="write_file", args={"path": str(directory / "new.txt")})
                     self.assertEqual(len(self.calls), int(expected is not None))
 
-    @unittest.skipUnless(os.name == "nt", "Windows junctions required")
+    @unittest.skipUnless(os.name == "nt", "Windows inherited handles required")
     def test_discovery_does_not_wait_for_descendant_stdout_close(self):
         directory = Path(self.tempdir.name)
         script = directory / "inherited_stdout.py"
@@ -322,6 +348,7 @@ class GitAiPluginTests(unittest.TestCase):
             "    deadline = time.monotonic() + 30\n"
             "    while not (base / 'release').exists() and time.monotonic() < deadline:\n"
             "        time.sleep(0.05)\n"
+            "    os.write(1, b'descendant still owns stdout\\n')\n"
             "    (base / 'done').write_text('done')\n"
             "else:\n"
             "    subprocess.Popen([sys.executable, __file__, 'child', str(base)], close_fds=False)\n"
@@ -343,6 +370,7 @@ class GitAiPluginTests(unittest.TestCase):
             self.assertEqual(root, str(directory))
             self.assertTrue(ready.exists())
             self.assertFalse(done.exists(), "descendant already closed stdout")
+            print('inherited stdout: root returned before child release; child pid', ready.read_text())
         finally:
             release.write_text("release", encoding="utf-8")
             deadline = time.monotonic() + 20
@@ -352,6 +380,16 @@ class GitAiPluginTests(unittest.TestCase):
                 real_run(["taskkill", "/PID", ready.read_text(), "/T", "/F"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             self.assertTrue(done.exists(), "descendant cleanup did not complete")
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            handle = kernel32.OpenProcess(0x100000, False, int(ready.read_text()))
+            if handle:
+                try:
+                    self.assertEqual(kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 20000), 0)
+                finally:
+                    kernel32.CloseHandle(ctypes.c_void_p(handle))
+            print('inherited stdout: child wrote after release and exited')
 
     @unittest.skipUnless(os.name == "nt", "Windows junctions required")
     def test_directory_junctions_discover_target_repository(self):
@@ -361,7 +399,9 @@ class GitAiPluginTests(unittest.TestCase):
             with self.subTest(alias=str(alias)):
                 # The second alias is under a different, valid repository.
                 if alias.parent == target:
-                    outer = Path(self.tempdir.name).parent / (self.repo.name + "-outer")
+                    outer_temp = tempfile.TemporaryDirectory()
+                    self.addCleanup(outer_temp.cleanup)
+                    outer = Path(outer_temp.name)
                     subprocess.run(["git", "init", "-q", str(outer)], check=True)
                     alias = outer / "alias"
                 subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(alias), str(target)],
@@ -369,6 +409,9 @@ class GitAiPluginTests(unittest.TestCase):
                 try:
                     self.calls.clear()
                     plugin._REPO_CACHE.clear()
+                    reference = self._git_reference(alias)
+                    self.assertEqual(reference, (0, str(self.repo)))
+                    print('junction', str(alias), 'git', reference)
                     args = {"path": str(alias / "new.txt")}
                     plugin._on_pre_tool_call(tool_name="write_file", args=args)
                     plugin._on_post_tool_call(tool_name="write_file", args=args, status="ok")
