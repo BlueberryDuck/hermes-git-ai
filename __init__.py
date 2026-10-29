@@ -220,7 +220,7 @@ def _repo_root(path: Path) -> str | None:
         return cached
     try:
         # A file does not wait for descendants to close inherited stdout.
-        with tempfile.TemporaryFile(mode="w+t") as output:
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="surrogateescape") as output:
             completed = subprocess.run(
                 ["git", "-C", os.fspath(candidate), "rev-parse", "--show-toplevel"],
                 stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL,

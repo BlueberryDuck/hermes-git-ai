@@ -297,6 +297,21 @@ class GitAiPluginTests(unittest.TestCase):
                                      "HERMES_GIT_AI_DISABLED": ""}):
             self.assertEqual(plugin._git_ai_command(), [sys.executable])
 
+    def test_discovery_preserves_unicode_roots_with_utf8_mode_off(self):
+        env = os.environ.copy()
+        env.update(PYTHONUTF8="0", PYTHONIOENCODING="utf-8")
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as output:
+            child = subprocess.run(
+                [sys.executable, "-B", str(Path(__file__).resolve()),
+                 "--unicode-child", str(self.repo)],
+                env=env, stdin=subprocess.DEVNULL, stdout=output,
+                stderr=output, timeout=60, check=False,
+            )
+            output.seek(0)
+            details = output.read()
+        print(details)
+        self.assertEqual(child.returncode, 0, details)
+
     def test_discovery_caches_only_successful_roots(self):
         self.assertEqual(plugin._repo_root(self.repo), str(self.repo))
         with patch.object(plugin.subprocess, "run", side_effect=OSError("unavailable")) as run:
@@ -453,5 +468,49 @@ class GitAiPluginTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+def _unicode_child(directory):
+    import locale
+
+    class UnicodeRoots(unittest.TestCase):
+        def test_roots_and_cached_roots_match_git(self):
+            self.assertEqual(sys.flags.utf8_mode, 0)
+            print("child module:", plugin.__file__, "UTF-8 mode:", sys.flags.utf8_mode,
+                  "locale:", locale.getpreferredencoding(False), flush=True)
+            for name in ("ascii_repo", "caf\u00e9_repo", "\u4e2d\u6587_repo"):
+                root = Path(directory) / name
+                nested = root / "sub"
+                nested.mkdir(parents=True)
+                subprocess.run(["git", "init", "-q", str(root)], check=True,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=15)
+                with tempfile.TemporaryFile(mode="w+b") as output:
+                    reference = subprocess.run(
+                        ["git", "-C", str(nested), "rev-parse", "--show-toplevel"],
+                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL,
+                        timeout=15, check=True,
+                    )
+                    output.seek(0)
+                    expected = os.path.normpath(output.read().decode("utf-8").strip())
+                self.assertEqual(reference.returncode, 0)
+                self.assertEqual(expected, os.path.normpath(str(root)))
+                plugin._REPO_CACHE.clear()
+                first = plugin._repo_root(nested)
+                with patch.object(plugin.subprocess, "run", side_effect=AssertionError("cache missed")):
+                    cached = plugin._repo_root(nested)
+                print(ascii(name), "expected", ascii(expected), "first", ascii(first),
+                      "cached", ascii(cached), flush=True)
+                with self.subTest(root=name, result="first"):
+                    self.assertEqual(first, expected)
+                with self.subTest(root=name, result="cached"):
+                    self.assertEqual(cached, expected)
+
+    result = unittest.TextTestRunner(verbosity=2).run(
+        unittest.defaultTestLoader.loadTestsFromTestCase(UnicodeRoots)
+    )
+    return 0 if result.wasSuccessful() else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--unicode-child":
+        raise SystemExit(_unicode_child(sys.argv[2]))
     unittest.main()
