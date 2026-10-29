@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import uuid
 from pathlib import Path
@@ -210,8 +211,6 @@ def _terminal_cwd(args: Mapping[str, Any], session_id: str, task_id: str) -> Pat
 
 
 def _repo_root(path: Path) -> str | None:
-    # Git subprocess pipes can outlive their parent on Windows. Do not start
-    # a subprocess in a pre-tool policy hook just to locate a worktree.
     candidate = path if path.is_dir() else path.parent
     candidate = Path(os.path.abspath(os.fspath(candidate)))
     cache_key = os.fspath(candidate)
@@ -219,14 +218,26 @@ def _repo_root(path: Path) -> str | None:
         cached = _REPO_CACHE.get(cache_key)
     if cached:
         return cached
-    for directory in (candidate, *candidate.parents):
-        marker = directory / ".git"
-        if marker.is_dir() or marker.is_file():
-            root = os.fspath(directory)
-            with _LOCK:
-                _REPO_CACHE[cache_key] = root
-            return root
-    return None
+    try:
+        # A file does not wait for descendants to close inherited stdout.
+        with tempfile.TemporaryFile(mode="w+t") as output:
+            completed = subprocess.run(
+                ["git", "-C", os.fspath(candidate), "rev-parse", "--show-toplevel"],
+                stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL,
+                timeout=2, check=False,
+            )
+            if completed.returncode != 0:
+                return None
+            output.seek(0)
+            root = output.read().strip()
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return None
+    if not root:
+        return None
+    root = os.path.normpath(root)
+    with _LOCK:
+        _REPO_CACHE[cache_key] = root
+    return root
 
 
 def _patch_paths(args: Mapping[str, Any], task_id: str) -> list[Path]:
