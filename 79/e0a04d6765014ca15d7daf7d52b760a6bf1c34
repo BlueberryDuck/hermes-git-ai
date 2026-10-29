@@ -1,0 +1,22 @@
+tests/test_git_ai_plugin.py
+  s_62ad0bbe45c8ed::t_a5237735e606b0 63-71,329-331,383-391,412-414
+  s_62ad0bbe45c8ed::t_469cd6774acf1d 300-309
+  s_62ad0bbe45c8ed::t_7e53e4061eb38e 314-317,319
+  s_62ad0bbe45c8ed::t_983316265f1400 318,337,351,373,392,402-404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "79e0a04d6765014ca15d7daf7d52b760a6bf1c34",
+  "prompts": {},
+  "sessions": {
+    "s_62ad0bbe45c8ed": {
+      "agent_id": {
+        "tool": "hermes",
+        "id": "local-eb2ebf372f54ad3a403ef7c43b0374d685b8bc90c9c9cacc2b5188f04e6b85f7",
+        "model": "gpt-6.1-terra"
+      },
+      "human_author": "Sebastian Bunge <82870811+BlueberryDuck@users.noreply.github.com>"
+    }
+  }
+}
