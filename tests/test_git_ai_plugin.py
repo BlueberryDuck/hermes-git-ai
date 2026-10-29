@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -267,30 +268,114 @@ class GitAiPluginTests(unittest.TestCase):
             )
         self.assertNotIn("transcript", self.calls[0][0])
 
-    def test_tool_events_do_not_depend_on_git_subprocesses(self):
-        self._seed_session()
-        cases = (
-            ("write_file", {"path": "src/new.py", "content": "value = 1\n"},
-             ["human", "ai_agent"]),
-            ("terminal", {"command": "echo generated", "workdir": str(self.repo)},
-             ["pre_shell_command", "post_shell_command"]),
+    def test_git_discovery_uses_file_output_and_fails_open_on_timeout(self):
+        def timeout(argv, **kwargs):
+            self.assertEqual(kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertEqual(kwargs.get("stderr"), subprocess.DEVNULL)
+            self.assertNotEqual(kwargs.get("stdout"), subprocess.PIPE)
+            self.assertTrue(hasattr(kwargs.get("stdout"), "fileno"))
+            self.assertGreater(kwargs.get("timeout", 0), 0)
+            self.assertLessEqual(kwargs["timeout"], 10)
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with patch.object(plugin.subprocess, "run", side_effect=timeout) as run:
+            self.assertIsNone(plugin._repo_root(self.repo))
+            self.assertEqual(run.call_count, 1)
+            self.assertIsNone(plugin._repo_root(self.repo))
+            self.assertEqual(run.call_count, 2)
+
+    def test_git_ai_executable_override_is_selected(self):
+        with patch.dict(os.environ, {"HERMES_GIT_AI_BIN": sys.executable,
+                                     "HERMES_GIT_AI_DISABLED": ""}):
+            self.assertEqual(plugin._git_ai_command(), [sys.executable])
+
+    def test_invalid_markers_follow_git_discovery(self):
+        for outer in (False, True):
+            for kind in ("file", "directory"):
+                with self.subTest(outer=outer, kind=kind):
+                    parent = self.repo if outer else Path(tempfile.mkdtemp())
+                    directory = parent / ("invalid-%s-%s" % (outer, kind))
+                    directory.mkdir()
+                    marker = directory / ".git"
+                    if kind == "file":
+                        marker.write_text("invalid marker\n", encoding="utf-8")
+                    else:
+                        marker.mkdir()
+                    plugin._REPO_CACHE.clear()
+                    expected = str(self.repo) if outer and kind == "directory" else None
+                    self.assertEqual(plugin._repo_root(directory), expected)
+                    self.calls.clear()
+                    plugin._on_pre_tool_call(tool_name="write_file", args={"path": str(directory / "new.txt")})
+                    self.assertEqual(len(self.calls), int(expected is not None))
+
+    @unittest.skipUnless(os.name == "nt", "Windows junctions required")
+    def test_discovery_does_not_wait_for_descendant_stdout_close(self):
+        directory = Path(self.tempdir.name)
+        script = directory / "inherited_stdout.py"
+        ready, release, done = (directory / name for name in ("ready", "release", "done"))
+        script.write_text(
+            "import os, subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "base = Path(sys.argv[2])\n"
+            "if sys.argv[1] == 'child':\n"
+            "    (base / 'ready').write_text(str(os.getpid()))\n"
+            "    deadline = time.monotonic() + 30\n"
+            "    while not (base / 'release').exists() and time.monotonic() < deadline:\n"
+            "        time.sleep(0.05)\n"
+            "    (base / 'done').write_text('done')\n"
+            "else:\n"
+            "    subprocess.Popen([sys.executable, __file__, 'child', str(base)], close_fds=False)\n"
+            "    deadline = time.monotonic() + 20\n"
+            "    while not (base / 'ready').exists() and time.monotonic() < deadline:\n"
+            "        time.sleep(0.05)\n"
+            "    if not (base / 'ready').exists(): sys.exit(3)\n"
+            "    print(str(base), flush=True)\n",
+            encoding="utf-8",
         )
-        for tool_name, args, expected_types in cases:
-            with self.subTest(tool=tool_name):
-                self.calls.clear()
-                plugin._REPO_CACHE.clear()
-                with patch.object(
-                    plugin.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 2)
-                ):
-                    plugin._on_pre_tool_call(
-                        tool_name=tool_name, args=args, session_id="session-1", task_id="task-1"
-                    )
-                    plugin._on_post_tool_call(
-                        tool_name=tool_name, args=args, session_id="session-1", task_id="task-1",
-                        result=json.dumps({"ok": True}), status="ok",
-                    )
-                self.assertEqual([payload["type"] for payload, _ in self.calls], expected_types)
-                self.assertTrue(all(cwd == str(self.repo) for _, cwd in self.calls))
+        real_run = subprocess.run
+
+        def invoke_fixture(argv, **kwargs):
+            return real_run([sys.executable, str(script), "parent", str(directory)], **kwargs)
+
+        try:
+            with patch.object(plugin.subprocess, "run", side_effect=invoke_fixture):
+                root = plugin._repo_root(directory)
+            self.assertEqual(root, str(directory))
+            self.assertTrue(ready.exists())
+            self.assertFalse(done.exists(), "descendant already closed stdout")
+        finally:
+            release.write_text("release", encoding="utf-8")
+            deadline = time.monotonic() + 20
+            while ready.exists() and not done.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if ready.exists() and not done.exists():
+                real_run(["taskkill", "/PID", ready.read_text(), "/T", "/F"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            self.assertTrue(done.exists(), "descendant cleanup did not complete")
+
+    @unittest.skipUnless(os.name == "nt", "Windows junctions required")
+    def test_directory_junctions_discover_target_repository(self):
+        target = self.repo / "src"
+        outside = Path(self.tempdir.name).parent / (self.repo.name + "-alias")
+        for alias in (outside, self.repo / "src" / "nested-alias"):
+            with self.subTest(alias=str(alias)):
+                # The second alias is under a different, valid repository.
+                if alias.parent == target:
+                    outer = Path(self.tempdir.name).parent / (self.repo.name + "-outer")
+                    subprocess.run(["git", "init", "-q", str(outer)], check=True)
+                    alias = outer / "alias"
+                subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(alias), str(target)],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    self.calls.clear()
+                    plugin._REPO_CACHE.clear()
+                    args = {"path": str(alias / "new.txt")}
+                    plugin._on_pre_tool_call(tool_name="write_file", args=args)
+                    plugin._on_post_tool_call(tool_name="write_file", args=args, status="ok")
+                    self.assertEqual([p["type"] for p, _ in self.calls], ["human", "ai_agent"])
+                    self.assertEqual([cwd for _, cwd in self.calls], [str(self.repo)] * 2)
+                finally:
+                    os.rmdir(alias)
 
     def test_file_edits_find_normal_nested_and_linked_worktree_roots(self):
         nested = self.repo / "nested"
