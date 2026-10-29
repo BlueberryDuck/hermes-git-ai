@@ -1,0 +1,19 @@
+__init__.py
+  s_62ad0bbe45c8ed::t_5dd175ded02d88 18,221-240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1104b1723cdb6bb626801cde2bb9b0591124ff8e",
+  "prompts": {},
+  "sessions": {
+    "s_62ad0bbe45c8ed": {
+      "agent_id": {
+        "tool": "hermes",
+        "id": "local-eb2ebf372f54ad3a403ef7c43b0374d685b8bc90c9c9cacc2b5188f04e6b85f7",
+        "model": "gpt-6.1-terra"
+      },
+      "human_author": "Sebastian Bunge <82870811+BlueberryDuck@users.noreply.github.com>"
+    }
+  }
+}
